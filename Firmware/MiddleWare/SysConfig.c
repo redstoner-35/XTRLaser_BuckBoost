@@ -1,0 +1,256 @@
+/****************************************************************************/
+/** \file SysConfig.c
+/** \Author redstoner_35
+/** \Project Xtern Ripper Laser Edition 
+/** \Description 这个文件为中层设备驱动文件，负责实现系统非易失性数据的结构化归档
+存储和上电时的数据读入，实现非易失性存储
+
+**	History: Initial Release
+**	
+*****************************************************************************/
+/****************************************************************************/
+/*	include files
+*****************************************************************************/
+#include "cms8s6990.h"
+#include "ModeControl.h"
+#include "SysConfig.h"
+#include "Flash.h"
+#include "SideKey.h"
+#include "delay.h"
+#include "LEDMgmt.h"
+#include "SysReset.h"
+#include "OutputChannel.h"
+#include "ADCCfg.h"
+
+/****************************************************************************/
+/*	Local pre-processor symbols/macros('#define')
+****************************************************************************/
+
+//数据区Flash定义
+#define	DataFlashLen 0x3FF  //CMS8S6990单片机的数据区有1KByte，寻址范围是0-3FF
+#define SysCfgGroupLen (DataFlashLen/sizeof(SysROMImg))-1   //可用的配置组合长度
+
+//内部bit field的存储Mask
+#define IsLocked_MSK 0x01  //是否锁定 bit1
+#define IsEnableIdleLED_MSK 0x02 //是否开启有源夜光 bit2
+#define IsEnable2SMode_MSK 0x04 //是否开启双锂模式 bit3
+
+/****************************************************************************/
+/*	Global variable definitions(declared in header file with 'extern')
+****************************************************************************/
+
+/****************************************************************************/
+/*	Local type definitions('typedef')
+****************************************************************************/
+
+//存储类型声明
+typedef struct
+	{
+	int RampCurrent;
+  unsigned char BitfieldMem1;
+	}SysStorDef;
+	
+typedef union
+	{
+	SysStorDef Data;
+	char ByteBuf[sizeof(SysStorDef)];
+	}SysDataUnion;
+
+typedef struct
+	{
+	SysDataUnion SysConfig;
+	char CheckSum;
+	}SysROMImageDef;
+
+typedef union
+	{
+	SysROMImageDef Data;
+	char ByteBuf[sizeof(SysROMImageDef)];
+	}SysROMImg;
+
+/****************************************************************************/
+/*	Local variable  definitions('static')
+****************************************************************************/
+static xdata unsigned int CurrentIdx;
+static xdata u8 CurrentCRC;
+
+/****************************************************************************/
+/*	Function implementation - local('static')
+****************************************************************************/
+static u8 PEC8Check(char *DIN,char Len)	//CRC-8计算 
+	{
+	unsigned char crcbuf=0xFF;
+	unsigned char i;
+	do
+		{
+		//载入数据
+		crcbuf^=*DIN++;
+		//计算
+		i=8;
+			do
+			{
+			if(crcbuf&0x80)crcbuf=(crcbuf<<1)^0x07;//最高位为1，左移之后和多项式XOR
+			else crcbuf<<=1;//最高位为0，只移位不XOR
+			}
+		while(--i);
+		}
+	while(--Len);
+	//输出结果
+	return crcbuf;
+	}
+
+//从EEPROM内寻找最后的一组系统配置
+static int SearchSysConfig(SysROMImg *ROMData)	
+	{
+	unsigned char i;
+	int Len=0;
+	//解锁flash并开始读取
+	SetFlashState(1);
+	do
+		{		
+		for(i=0;i<sizeof(SysROMImageDef);i++)Flash_Operation(DataFlash_Read,i+(Len*sizeof(SysROMImg)),&ROMData->ByteBuf[i]); //从ROM内读取数据
+		if(ROMData->Data.CheckSum!=PEC8Check(ROMData->Data.SysConfig.ByteBuf,sizeof(SysStorDef)))break; //找到了没有被写入CRC校验不过的地方，就是你了
+		Len++;
+		}
+	while(Len<SysCfgGroupLen);
+	//读取上一组正确的配置
+	if(Len>0)Len--;
+	for(i=0;i<sizeof(SysROMImageDef);i++)Flash_Operation(DataFlash_Read,i+(Len*sizeof(SysROMImg)),&ROMData->ByteBuf[i]);
+	//读取结束，返回上一组有数据的index
+	return Len;
+	}
+
+//在重置出厂或者其余事件，触发LED快闪提示
+static void LEDFastFlashForEEPROMEvent(void)
+	{
+	unsigned char delay=100;
+	//锁定EEPROM	
+	SetFlashState(0);
+	//循环高频快闪
+	do
+		{
+		delay_ms(30);
+		LEDControlHandler();
+		//松开按键后开始计时
+		if(GetSideKeyRawGPIOState())delay--;
+		}
+	while(delay);
+	//触发系统重启
+	TriggerSoftwareReset();
+	}	
+	
+//准备初始的系统设置
+static void PrepareFactoryDefaultCfg(void)
+	{
+	LoadMinimumRampCurrentToRAM();	
+	IsSystemLocked=0;
+	IsEnableIdleLED=1;
+	//进行ADC测量
+  DisableADCAsync();
+	SystemTelemHandler();
+	IsEnable2SMode=Data.RawBattVolt>4.35?1:0;
+	}	
+	
+//尝试检测用户进行重置操作	
+static void ResetSysConfigToDefault(void)
+	{
+	//如果系统处于锁定状态，则不允许重置出厂设置
+  if(IsSystemLocked)return;
+	//准备初始的系统设置并保存
+  PrepareFactoryDefaultCfg();
+	SaveSysConfig(0); 					//写数据写成默认值
+	//配置指示灯准备显示
+	LEDMode=LED_AmberBlinkFast; //LED模式配置为黄色快闪
+	LEDFastFlashForEEPROMEvent(); //触发高速快闪并等待用户松开按键，松开后自动重启
+	}	
+	
+//显示系统数据存在错误
+static void ShowEPROMCorrupted(void)
+	{
+	//配置LED模式
+	LEDMode=LED_RedBlink_Fast; //LED模式配置为高速红色快闪
+  LEDFastFlashForEEPROMEvent(); //触发高速快闪并等待用户松开按键，松开后自动重启
+	}
+	
+/****************************************************************************/
+/*	Function implementation - global ('extern')
+****************************************************************************/
+	
+void ReadSysConfig(void)	//读取系统的整体配置
+	{
+	xdata SysROMImg ROMData;
+	//读取数据
+	CurrentIdx=SearchSysConfig(&ROMData);
+	//进行读出数据的校验
+	if(ROMData.Data.CheckSum==PEC8Check(ROMData.Data.SysConfig.ByteBuf,sizeof(SysStorDef)))
+		{
+		//校验成功，加载数据
+		IsEnable2SMode=ROMData.Data.SysConfig.Data.BitfieldMem1&IsEnable2SMode_MSK?1:0;
+		IsEnableIdleLED=ROMData.Data.SysConfig.Data.BitfieldMem1&IsEnableIdleLED_MSK?1:0;
+		IsSystemLocked=ROMData.Data.SysConfig.Data.BitfieldMem1&IsLocked_MSK?1:0;
+		SysCfg.RampCurrent=ROMData.Data.SysConfig.Data.RampCurrent;
+		//存储当前的index值
+		CurrentCRC=ROMData.Data.CheckSum;
+		CurrentIdx++; //当前位置有数据，需要让index+1移动到未写入的位置
+		
+		//用户按下按键，重置设置并重启
+		if(!GetSideKeyRawGPIOState())ResetSysConfigToDefault();
+		}
+	//校验失败重建数据
+	else 
+		{
+		PrepareFactoryDefaultCfg(); 
+		IsSystemLocked=1;  //系统刷写固件后首次上电，使系统处于锁定状态
+		SaveSysConfig(1);  //重建数据后立即保存参数
+		ShowEPROMCorrupted(); //显示EEPROM损坏
+		}
+	//读取操作完毕，锁定flash	
+	SetFlashState(0);
+	}
+
+//恢复到无极调光模式的最低电流
+void LoadMinimumRampCurrentToRAM(void)	
+	{
+	bool Result;
+	ModeStrDef *Mode=FindTargetMode(Mode_Ramp,&Result);
+	if(Result)SysCfg.RampCurrent=Mode->MinCurrent; //找到挡位数据中无极调光的挡位
+	else SysCfg.RampCurrent=200; //默认恢复为200mA
+	}	
+	
+//保存无极调光配置
+void SaveSysConfig(bit IsForceSave)
+	{
+	unsigned char i,BFBuf=0;
+	xdata SysROMImg SavedData;
+	//解锁flash（CRC校验模块需要读取Flash所以需要解锁）
+	SetFlashState(1);
+  //开始进行数据构建
+	if(IsSystemLocked)BFBuf|=IsLocked_MSK;										 //是否锁定
+	if(IsEnableIdleLED)BFBuf|=IsEnableIdleLED_MSK;             //是否开启有源夜光
+	if(IsEnable2SMode)BFBuf|=IsEnable2SMode_MSK;               //是否开启2S模式
+		
+	SavedData.Data.SysConfig.Data.BitfieldMem1=BFBuf;
+	SavedData.Data.SysConfig.Data.RampCurrent=SysCfg.RampCurrent;
+	SavedData.Data.CheckSum=PEC8Check(SavedData.Data.SysConfig.ByteBuf,sizeof(SysStorDef)); //计算CRC
+	//进行数据比对
+	if(!IsForceSave&&SavedData.Data.CheckSum==CurrentCRC)
+		{
+		SetFlashState(0);//读取操作完毕，锁定flash	
+	  return; //跳过保存操作，数据相同	
+		}
+	//数据需要保存，开始检测是否需要擦除
+	if(IsForceSave||CurrentIdx>=SysCfgGroupLen) 
+		{
+		//数据已经写满了，对扇区0和1进行完全擦除
+		Flash_Operation(DataFlash_Erase,0x200,&i);  //扇区2=512-1023
+		Flash_Operation(DataFlash_Erase,0,&i);      //扇区1=0-511
+		//从第0个位置开始写入
+		CurrentIdx=0;
+		}
+	//写入数据
+	for(i=0;i<sizeof(SysROMImageDef);i++)Flash_Operation(DataFlash_Write,i+(CurrentIdx*sizeof(SysROMImg)),&SavedData.ByteBuf[i]);	
+	CurrentIdx++; //本index已被写入，标记写到下个idx
+	CurrentCRC=SavedData.Data.CheckSum; //保存本次index的CRC8
+	SetFlashState(0);//写入操作完毕，锁定flash	
+	}	
+
