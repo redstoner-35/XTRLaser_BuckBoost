@@ -63,6 +63,7 @@ static char ErrTIMCounter(char buf,char Count)	//内部函数，故障计数器
 	//累加计数器
 	return buf<0x0F?buf+Count:0x0F;
 	}
+
 /****************************************************************************/
 /*	Function implementation - global ('extern')
 ****************************************************************************/
@@ -75,8 +76,8 @@ bit IsErrorFatal(void)
 		if(NonCriticalFault[i]==ErrCode)return 0;
 	//寻找了目前已有的错误码发现是致命问题
 	return 1;
-	}
-
+	}	
+	
 //报告错误
 void ReportError(FaultCodeDef Code)
 	{
@@ -143,17 +144,11 @@ void OutputFaultDetect(void)
 	else if(ShortBlankTIM<FaultBlankingInterval)ShortBlankTIM++; //时间未到不允许监测
 	else  //开始检测
 		{		
-		buf=ShortDetectTIM&0x0F; //取出定时器值					
+		buf=ShortDetectTIM&0x1F; //取出定时器值					
 		//输入过压保护以及MCU电压监控
 		MCUVDDFaultDetect();
 		if(Data.BatteryVoltage>4.35)ReportError(Fault_InputOVP);	
-		//输出开路检测
-		if(Data.OutputVoltage>5.9) 
-			{
-			buf=ErrTIMCounter(buf,2); //计时器累计
-			OErrID=1;
-			}		
-		//根据DCDC状态进行配置
+		//根据DCDC状态进行监视
 		else switch(OutputChannel_GetDCDCState())
 			{
 			case DCDC_ThermalShutDown:ReportError(Fault_DCDC_TSD);break;  //IC过温关闭
@@ -169,14 +164,22 @@ void OutputFaultDetect(void)
 			  buf=ErrTIMCounter(buf,1); //计时器累计
 				OErrID=2;			
 			  break;
+			//DCDC状态正常，执行开路检测
+			case DCDC_Normal:
+				//输出电压正常，复位计数器
+				if(Data.OutputVoltage<5.9)buf=0;
+				//输出电压异常，计时器继续累计然后触发保护
+				else buf=ErrTIMCounter(buf,2); 
+				OErrID=1; //该项错误ID=1
+			  break;
 		  //没有错误
-		  default: buf=buf>0?buf-1:0; //没有发生错误，清除计数器
+		  default:buf=0;  //没有问题，计数器复位
 			}
 		//进行定时器数值的回写
-		ShortDetectTIM=buf|(OErrID<<4);
+		ShortDetectTIM=buf|(OErrID<<5);
 		//状态检测
 		if(buf<0x0F)return; //没有故障,跳过执行
-		switch((ShortDetectTIM>>4)&0x0F)	
+		switch((ShortDetectTIM>>5)&0x07)	
 			{
 			case 0:ReportError(Fault_DCDCShort);break;
 			case 1:ReportError(Fault_DCDCOpen);break;

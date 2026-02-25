@@ -4,10 +4,10 @@
 typedef enum
 	{
 	LED_OFF=0, //关闭
-	LED_Green=1, //绿色常亮
-	LED_Red=2, //红色常亮
-	LED_RedBlink=3, //红色闪烁
-	LED_Amber=4, //黄色常亮
+	LED_Red=1, //红色常亮
+	LED_Amber=2, //黄色常亮
+	LED_Green=3, //绿色常亮
+	LED_RedBlink=4, //红色闪烁
 	LED_RedBlink_Fast=5, //红色快闪
 	LED_AmberBlinkFast=6, //黄色快速闪烁
 	LED_RedBlinkFifth=7, //红色快闪五次
